@@ -1,0 +1,39 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: timeline-service:latest
+    environment:
+      PORT: "8080"
+    ports:
+      # Host-side port is configurable: HOST_PORT=9090 docker compose up -d
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,os,sys,urllib.request; port=os.environ.get('PORT','8080'); r=urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=2); sys.exit(0 if r.status==200 and json.loads(r.read()).get('status')=='ok' else 1)"
+      interval: 5s
+      timeout: 3s
+      start_period: 3s
+      retries: 12
+    restart: unless-stopped
+
+  # One-shot verification: waits until the app is healthy, then runs the
+  # build check, the full unit-test suite and constant/linear API smoke
+  # tests, then exits with a status code reporting the result.
+  verify:
+    image: timeline-service:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: ["python", "scripts/verify.py"]
+    working_dir: /app
+    environment:
+      APP_URL: "http://app:8080"
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: "no"
