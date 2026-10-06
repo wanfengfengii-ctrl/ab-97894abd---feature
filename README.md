@@ -8,6 +8,9 @@
 - 全部累计时长使用 `fractions.Fraction` 精确计算，**只在最后一步**对纳秒时刻和
   采样帧各自按「四舍六入、五取偶」（round-half-to-even）取整一次。
 - 同刻度提示点必然得到相同投影；响应严格保持提示点的原始顺序。
+- 可选 `clock_anchor` 把整张乐谱重新锚定到录音系统重启后的会话时钟：
+  以已确认同步点的读数为基准，按两刻度间未舍入的有符号精确时差换算，
+  锚点位于提示点之前或之后，舍入结果完全一致。
 
 ## 接口
 
@@ -37,6 +40,7 @@
 | `sample_rate` | 正整数（Hz） |
 | `tempo_points` | 1–500 个；`tick` 必须从 0 开始且严格递增；`microseconds_per_quarter` 为正整数（微秒/四分音符）；`mode` 为 `constant` 或 `linear` |
 | `cues` | 1–2000 个；`id` 为非空字符串或整数且全请求唯一；`tick` 为非负整数 |
+| `clock_anchor` | 可选；对象，恰好包含 `tick`、`time_nanoseconds`、`sample_frame` 三个非负整数 |
 
 语义：
 
@@ -51,14 +55,49 @@
 {
   "ticks_per_quarter": 480,
   "cues": [
-    {"id": "light-01",    "tick": 0,    "time_nanoseconds": 0,         "sample_frame": 0},
-    {"id": "subtitle-07", "tick": 2400, "time_nanoseconds": 2362500000, "sample_frame": 113400}
+    {"id": "light-01",    "tick": 0,    "time_nanoseconds": 0,          "sample_frame": 0},
+    {"id": "subtitle-07", "tick": 2400, "time_nanoseconds": 2287500000, "sample_frame": 109800}
   ]
 }
 ```
 
 - `time_nanoseconds = round_half_even(累计微秒 × 1000)`
 - `sample_frame = round_half_even(累计微秒 × sample_rate / 1_000_000)`（零基帧）
+
+### 会话时钟锚点（`clock_anchor`）
+
+长场次中途重启录音系统后，可用一个已确认的同步点把整张乐谱投影到新的
+会话时钟。提供 `clock_anchor` 时，对每个提示点：
+
+- `time_nanoseconds = round_half_even(anchor.time_nanoseconds + (elapsed(cue) − elapsed(anchor.tick)) × 1000)`
+- `sample_frame = round_half_even(anchor.sample_frame + (elapsed(cue) − elapsed(anchor.tick)) × sample_rate / 1_000_000)`
+
+其中时差是**两刻度间未舍入的有符号精确值**（`Fraction`），半偶取整只作用于
+最终求和结果一次，因此锚点位于提示点之前或之后，舍入结果一致；同刻度提示
+仍然完全相同。省略 `clock_anchor` 时，状态码、响应字段、错误顺序与数值与
+不提供锚点的历史行为完全一致。
+
+若任一提示点在任一时钟上投影为负值（落在会话时钟原点之前），整个请求以
+400 失败，错误码 `NEGATIVE_PROJECTION`，`path` 指向对应的
+`/cues/<i>/time_nanoseconds` 或 `/cues/<i>/sample_frame`，不返回任何部分结果。
+
+完整示例（在上面的请求中加入锚点）：
+
+```json
+"clock_anchor": {"tick": 1920, "time_nanoseconds": 5000000000, "sample_frame": 240000}
+```
+
+对应响应：
+
+```json
+{
+  "ticks_per_quarter": 480,
+  "cues": [
+    {"id": "light-01",    "tick": 0,    "time_nanoseconds": 3000000000, "sample_frame": 144000},
+    {"id": "subtitle-07", "tick": 2400, "time_nanoseconds": 5287500000, "sample_frame": 253800}
+  ]
+}
+```
 
 健康检查：`GET /health` → `200 {"status":"ok"}`（同时提供 `/healthz`、`/ready`）。
 
@@ -79,16 +118,19 @@
       {"code": "NON_POSITIVE_TEMPO", "path": "/tempo_points/1/microseconds_per_quarter",       "message": "..."},
       {"code": "INVALID_MODE",       "path": "/tempo_points/1/mode",                           "message": "..."},
       {"code": "CUE_OUT_OF_RANGE",   "path": "/cues/4/tick",                                   "message": "..."},
-      {"code": "DUPLICATE_CUE_ID",   "path": "/cues/9/id",                                     "message": "... /cues/2 ..."}
+      {"code": "DUPLICATE_CUE_ID",   "path": "/cues/9/id",                                     "message": "... /cues/2 ..."},
+      {"code": "ANCHOR_OUT_OF_RANGE","path": "/clock_anchor/tick",                             "message": "..."},
+      {"code": "NEGATIVE_PROJECTION","path": "/cues/3/time_nanoseconds",                       "message": "..."}
     ]
   }
 }
 ```
 
 其他错误码：`MISSING_FIELD`、`INVALID_TYPE`（JSON 布尔值不接受为整数）、
-`INVALID_COUNT`、`UNKNOWN_FIELD`，以及传输层的 `MALFORMED_JSON`、
-`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。同一请求产生的错误集合与顺序是
-确定性的，可用于稳定比对。
+`INVALID_COUNT`、`UNKNOWN_FIELD`、`ANCHOR_OUT_OF_RANGE`（锚点读数为负）、
+`NEGATIVE_PROJECTION`（锚定后提示点在会话时钟上投影为负），以及传输层的
+`MALFORMED_JSON`、`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。同一请求产生的
+错误集合与顺序是确定性的，可用于稳定比对。
 
 ## 本地运行（无需 Docker）
 
@@ -104,8 +146,8 @@ python3 -m unittest discover -s tests -t .
 HOST_PORT=9090 docker compose up -d app
 
 # 一次性 verify 服务：等待 app 健康后，依次执行
-# 构建（字节码编译）、全部单元测试、恒定段/渐变段/错误请求 API 冒烟，
-# 随后自行退出，退出码即结果（0 成功）。
+# 构建（字节码编译）、全部单元测试、恒定段/渐变段/锚定（恒定段、渐变段、
+# 负值拒绝）/错误请求 API 冒烟，随后自行退出，退出码即结果（0 成功）。
 docker compose up --abort-on-container-exit --exit-code-from verify verify
 ```
 

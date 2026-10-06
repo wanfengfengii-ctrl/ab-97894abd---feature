@@ -4,8 +4,9 @@ Steps, in order:
   1. wait for the application's health endpoint to report ready;
   2. byte-compile every source file (build check);
   3. run the full unit test suite;
-  4. run API smoke tests covering constant and linear-ramp segments plus a
-     validation-failure case;
+  4. run API smoke tests covering constant and linear-ramp segments,
+     clock-anchored projections across constant and linear segments,
+     negative-projection rejection, and a validation-failure case;
   5. exit non-zero if anything failed so ``docker compose up`` reports it.
 """
 
@@ -155,6 +156,127 @@ def smoke_linear_segment() -> bool:
     return True
 
 
+def smoke_anchor_constant_segment() -> bool:
+    # Anchor at the tempo change; cues land on both sides of it and of the
+    # anchor, so signed offsets cross two constant segments.
+    payload = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"},
+            {"tick": 480, "microseconds_per_quarter": 250000, "mode": "constant"},
+        ],
+        "clock_anchor": {
+            "tick": 480,
+            "time_nanoseconds": 5_000_000_000,
+            "sample_frame": 240_000,
+        },
+        "cues": [
+            {"id": "before", "tick": 0},
+            {"id": "at", "tick": 480},
+            {"id": "at-dup", "tick": 480},
+            {"id": "after", "tick": 1440},
+        ],
+    }
+    status, body = post(payload)
+    if status != 200:
+        print(f"[verify] anchor constant smoke expected 200, got {status}: {body}")
+        return False
+    cues = {c["id"]: c for c in body["cues"]}
+    expected = {
+        "before": (4_500_000_000, 216_000),  # 0.5s before the anchor
+        "at": (5_000_000_000, 240_000),      # the anchor readings themselves
+        "after": (5_500_000_000, 264_000),   # 0.5s after, slower segment
+    }
+    for cid, (nanos, frame) in expected.items():
+        actual = (cues[cid]["time_nanoseconds"], cues[cid]["sample_frame"])
+        if actual != (nanos, frame):
+            print(f"[verify] anchor constant cue {cid}: {actual} != {(nanos, frame)}")
+            return False
+    if (
+        cues["at"]["time_nanoseconds"] != cues["at-dup"]["time_nanoseconds"]
+        or cues["at"]["sample_frame"] != cues["at-dup"]["sample_frame"]
+    ):
+        print("[verify] same-tick anchored cues projected differently")
+        return False
+    print("[verify] anchored constant-segment smoke OK")
+    return True
+
+
+def smoke_anchor_linear_segment() -> bool:
+    # Anchor sits inside the linear ramp; cues reach back across the ramp
+    # start and forward into the constant tail.
+    payload = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 600000, "mode": "linear"},
+            {"tick": 480, "microseconds_per_quarter": 200000, "mode": "constant"},
+        ],
+        "clock_anchor": {
+            "tick": 240,
+            "time_nanoseconds": 3_000_000_000,
+            "sample_frame": 144_000,
+        },
+        "cues": [
+            {"id": "ramp-start", "tick": 0},
+            {"id": "ramp-end", "tick": 480},
+            {"id": "tail", "tick": 720},
+        ],
+    }
+    status, body = post(payload)
+    if status != 200:
+        print(f"[verify] anchor linear smoke expected 200, got {status}: {body}")
+        return False
+    cues = {c["id"]: c for c in body["cues"]}
+    # elapsed(240) = 250000us; offsets are exact signed trapezoid areas.
+    expected = {
+        "ramp-start": (2_750_000_000, 132_000),  # -250000us across the ramp
+        "ramp-end": (3_150_000_000, 151_200),    # +150000us to the ramp end
+        "tail": (3_250_000_000, 156_000),        # +250000us into the tail
+    }
+    for cid, (nanos, frame) in expected.items():
+        actual = (cues[cid]["time_nanoseconds"], cues[cid]["sample_frame"])
+        if actual != (nanos, frame):
+            print(f"[verify] anchor linear cue {cid}: {actual} != {(nanos, frame)}")
+            return False
+    print("[verify] anchored linear-segment smoke OK")
+    return True
+
+
+def smoke_anchor_negative_rejected() -> bool:
+    # The cue at tick 0 lands 0.5s/24000 frames before the anchor, far past
+    # the session-clock origin: the whole request must fail with 400 and no
+    # partial projections.
+    payload = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"}
+        ],
+        "clock_anchor": {"tick": 480, "time_nanoseconds": 1000, "sample_frame": 5},
+        "cues": [{"id": "too-early", "tick": 0}],
+    }
+    status, body = post(payload)
+    if status != 400:
+        print(f"[verify] anchor negative smoke expected 400, got {status}: {body}")
+        return False
+    if "cues" in body:
+        print("[verify] negative-projection response leaked partial projections")
+        return False
+    errors = body["error"]["errors"]
+    codes_paths = {(error["code"], error["path"]) for error in errors}
+    for required in (
+        ("NEGATIVE_PROJECTION", "/cues/0/time_nanoseconds"),
+        ("NEGATIVE_PROJECTION", "/cues/0/sample_frame"),
+    ):
+        if required not in codes_paths:
+            print(f"[verify] anchor negative smoke missing {required}: {codes_paths}")
+            return False
+    print("[verify] anchored negative-projection smoke OK")
+    return True
+
+
 def smoke_validation_rejected() -> bool:
     payload = {
         "ticks_per_quarter": 480,
@@ -188,6 +310,9 @@ def main() -> int:
         ("unit tests", run_unit_tests),
         ("constant smoke", smoke_constant_segment),
         ("linear smoke", smoke_linear_segment),
+        ("anchored constant smoke", smoke_anchor_constant_segment),
+        ("anchored linear smoke", smoke_anchor_linear_segment),
+        ("anchored negative smoke", smoke_anchor_negative_rejected),
         ("validation smoke", smoke_validation_rejected),
     ]
     failures = []

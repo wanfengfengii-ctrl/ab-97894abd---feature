@@ -22,8 +22,8 @@ services:
     restart: unless-stopped
 
   # One-shot verification: waits until the app is healthy, then runs the
-  # build check, the full unit-test suite and constant/linear API smoke
-  # tests, then exits with a status code reporting the result.
+  # build check, the full unit-test suite and constant/linear/anchored API
+  # smoke tests, then exits with a status code reporting the result.
   verify:
     image: timeline-service:latest
     build:

@@ -4,6 +4,12 @@ All accumulation is done with :class:`fractions.Fraction` so that tempo
 automation across many segments cannot accumulate rounding error.  The two
 reported integers (nanosecond time and zero-based sample frame) are each
 rounded once, at the end, using round-half-to-even ("banker's rounding").
+
+An optional clock anchor re-roots the projection at a confirmed sync point:
+each cue is placed by adding the exact signed offset between the cue tick
+and the anchor tick to the anchor's session-clock readings, so the single
+final rounding is unaffected by whether the anchor sits before or after
+the cue.
 """
 
 from __future__ import annotations
@@ -16,6 +22,9 @@ MICROS_PER_QUARTER_FIELD = "microseconds_per_quarter"
 TICK_FIELD = "tick"
 MODE_FIELD = "mode"
 ID_FIELD = "id"
+ANCHOR_FIELD = "clock_anchor"
+ANCHOR_NS_FIELD = "time_nanoseconds"
+ANCHOR_FRAME_FIELD = "sample_frame"
 
 MODE_CONSTANT = "constant"
 MODE_LINEAR = "linear"
@@ -67,7 +76,13 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
             }
         }
 
-    known_fields = {"ticks_per_quarter", "sample_rate", "tempo_points", "cues"}
+    known_fields = {
+        "ticks_per_quarter",
+        "sample_rate",
+        "tempo_points",
+        "cues",
+        ANCHOR_FIELD,
+    }
     for field in payload:
         if field not in known_fields:
             errors.append(_err("UNKNOWN_FIELD", f"/{field}", "unexpected field"))
@@ -321,6 +336,49 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
             else:
                 cues.append(None)
 
+    # Parse the optional clock anchor: a confirmed sync point whose
+    # session-clock readings become the projection origin for every cue.
+    anchor: tuple[int, int, int] | None = None
+    if ANCHOR_FIELD in payload:
+        raw_anchor = payload[ANCHOR_FIELD]
+        if not isinstance(raw_anchor, dict):
+            errors.append(_err("INVALID_TYPE", f"/{ANCHOR_FIELD}", "expected object"))
+        else:
+            anchor_fields = (TICK_FIELD, ANCHOR_NS_FIELD, ANCHOR_FRAME_FIELD)
+            for field in raw_anchor:
+                if field not in anchor_fields:
+                    errors.append(
+                        _err(
+                            "UNKNOWN_FIELD",
+                            f"/{ANCHOR_FIELD}/{field}",
+                            "unexpected field",
+                        )
+                    )
+            readings: dict[str, int] = {}
+            for field in anchor_fields:
+                path = f"/{ANCHOR_FIELD}/{field}"
+                value = raw_anchor.get(field)
+                if field not in raw_anchor:
+                    errors.append(_err("MISSING_FIELD", path, "field is required"))
+                elif not _is_int(value):
+                    errors.append(_err("INVALID_TYPE", path, "expected integer"))
+                elif value < 0:
+                    errors.append(
+                        _err(
+                            "ANCHOR_OUT_OF_RANGE",
+                            path,
+                            "clock anchor readings must be non-negative integers",
+                        )
+                    )
+                else:
+                    readings[field] = value
+            if len(readings) == len(anchor_fields):
+                anchor = (
+                    readings[TICK_FIELD],
+                    readings[ANCHOR_NS_FIELD],
+                    readings[ANCHOR_FRAME_FIELD],
+                )
+
     if errors:
         return 400, {
             "error": {
@@ -336,12 +394,21 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
     assert isinstance(raw_points, list)
     assert isinstance(raw_cues, list)
 
-    projected = _project(
+    projected, projection_errors = _project(
         ticks_per_quarter=ticks_per_quarter,
         sample_rate=sample_rate,
         points=[point for point in points if point is not None],
         cues=[cue for cue in cues if cue is not None],
+        anchor=anchor,
     )
+    if projection_errors:
+        return 400, {
+            "error": {
+                "code": "VALIDATION_FAILED",
+                "message": "request validation failed; no projections were produced",
+                "errors": projection_errors,
+            }
+        }
     return 200, {"ticks_per_quarter": ticks_per_quarter, "cues": projected}
 
 
@@ -351,8 +418,16 @@ def _project(
     sample_rate: int,
     points: list[tuple[int, int, str]],
     cues: list[tuple[Any, int]],
-) -> list[dict[str, Any]]:
-    """Project cues.  ``points`` are validated, ordered and start at tick 0."""
+    anchor: tuple[int, int, int] | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Project cues.  ``points`` are validated, ordered and start at tick 0.
+
+    Returns ``(projections, errors)``.  With a clock anchor, each cue is
+    placed on the session clock by adding the exact signed offset between
+    the cue tick and the anchor tick to the anchor's own readings; a cue
+    that would land at a negative value on either clock yields a
+    ``NEGATIVE_PROJECTION`` error instead of a projection.
+    """
     tpq = Fraction(ticks_per_quarter)
     ticks = [point[0] for point in points]
     tempos = [point[1] for point in points]
@@ -371,42 +446,82 @@ def _project(
         cumulative.append(cumulative[-1] + segment)
 
     last_index = len(points) - 1
-    results: list[dict[str, Any]] = []
 
-    for cue_id, cue_tick in cues:
-        index = bisect_right(ticks, cue_tick) - 1
+    def elapsed_at(tick: int) -> Fraction:
+        """Exact cumulative microseconds at ``tick`` (never rounded)."""
+        index = bisect_right(ticks, tick) - 1
         a = ticks[index]
         tempo_a = tempos[index]
-        elapsed: Fraction = cumulative[index]
+        elapsed = cumulative[index]
 
-        if cue_tick > a:
-            distance = cue_tick - a
+        if tick > a:
+            distance = tick - a
             if index == last_index or modes[index] == MODE_CONSTANT:
                 # Last point holds its tempo forever.
                 elapsed += Fraction(tempo_a * distance, ticks_per_quarter)
             else:
                 b = ticks[index + 1]
                 tempo_b = tempos[index + 1]
-                # A cue exactly at b is handled by the next segment (its
-                # cumulative value); here cue_tick is strictly inside (a, b).
-                # Average tempo over [a, cue_tick] for a linear tempo ramp:
-                # (tempo(a) + tempo(cue_tick)) / 2.
+                # A tick exactly at b is handled by the next segment (its
+                # cumulative value); here tick is strictly inside (a, b).
+                # Average tempo over [a, tick] for a linear tempo ramp:
+                # (tempo(a) + tempo(tick)) / 2.
                 average = tempo_a + Fraction(
                     (tempo_b - tempo_a) * distance, 2 * (b - a)
                 )
                 elapsed += average * Fraction(distance, tpq)
+        return elapsed
 
-        time_nanoseconds = _round_half_even(elapsed * 1000)
-        sample_frame = _round_half_even(
-            elapsed * sample_rate / Fraction(1_000_000)
-        )
+    anchor_elapsed: Fraction | None = None
+    anchor_ns = 0
+    anchor_frame = 0
+    if anchor is not None:
+        anchor_tick, anchor_ns, anchor_frame = anchor
+        anchor_elapsed = elapsed_at(anchor_tick)
+
+    results: list[dict[str, Any]] = []
+    projection_errors: list[dict[str, str]] = []
+
+    for cue_index, (cue_id, cue_tick) in enumerate(cues):
+        elapsed = elapsed_at(cue_tick)
+        if anchor_elapsed is None:
+            nanoseconds_exact = elapsed * 1000
+            frame_exact = elapsed * sample_rate / Fraction(1_000_000)
+        else:
+            # Signed, still-unrounded offset from the anchor, applied to the
+            # anchor's session-clock readings; the half-even rounding happens
+            # once, on this final sum, so a cue before the anchor rounds
+            # exactly like a cue after it.
+            delta = elapsed - anchor_elapsed
+            nanoseconds_exact = anchor_ns + delta * 1000
+            frame_exact = anchor_frame + delta * sample_rate / Fraction(1_000_000)
+
+        if nanoseconds_exact < 0 or frame_exact < 0:
+            if nanoseconds_exact < 0:
+                projection_errors.append(
+                    _err(
+                        "NEGATIVE_PROJECTION",
+                        f"/cues/{cue_index}/{ANCHOR_NS_FIELD}",
+                        f"cue {cue_id!r} projects to a negative session-clock time",
+                    )
+                )
+            if frame_exact < 0:
+                projection_errors.append(
+                    _err(
+                        "NEGATIVE_PROJECTION",
+                        f"/cues/{cue_index}/{ANCHOR_FRAME_FIELD}",
+                        f"cue {cue_id!r} projects to a negative session-clock frame",
+                    )
+                )
+            continue
+
         results.append(
             {
                 ID_FIELD: cue_id,
                 TICK_FIELD: cue_tick,
-                "time_nanoseconds": time_nanoseconds,
-                "sample_frame": sample_frame,
+                ANCHOR_NS_FIELD: _round_half_even(nanoseconds_exact),
+                ANCHOR_FRAME_FIELD: _round_half_even(frame_exact),
             }
         )
 
-    return results
+    return results, projection_errors

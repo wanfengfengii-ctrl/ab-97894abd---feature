@@ -239,6 +239,277 @@ class SameTickTests(unittest.TestCase):
         self.assertEqual(cues["at960"]["time_nanoseconds"], 550_000_000)
 
 
+class ClockAnchorTests(unittest.TestCase):
+    """Projection re-rooted at a confirmed session-clock sync point."""
+
+    CONSTANT_TWO_SEGMENT = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 500000, "mode": "constant"},
+            {"tick": 480, "microseconds_per_quarter": 250000, "mode": "constant"},
+        ],
+    }
+
+    RAMP = {
+        "ticks_per_quarter": 480,
+        "sample_rate": 48000,
+        "tempo_points": [
+            {"tick": 0, "microseconds_per_quarter": 600000, "mode": "linear"},
+            {"tick": 480, "microseconds_per_quarter": 200000, "mode": "constant"},
+        ],
+    }
+
+    def test_anchor_spans_constant_segments(self):
+        payload = {
+            **self.CONSTANT_TWO_SEGMENT,
+            "clock_anchor": {
+                "tick": 480,
+                "time_nanoseconds": 5_000_000_000,
+                "sample_frame": 240_000,
+            },
+            "cues": [
+                cue("t0", 0),
+                cue("t240", 240),
+                cue("t480", 480),
+                cue("t960", 960),
+                cue("t1440", 1440),
+            ],
+        }
+        cues = {c["id"]: c for c in project(payload)}
+        self.assertEqual(
+            [(c["time_nanoseconds"], c["sample_frame"]) for c in cues.values()],
+            [
+                (4_500_000_000, 216_000),  # 0.5s before the anchor
+                (4_750_000_000, 228_000),  # 0.25s before the anchor
+                (5_000_000_000, 240_000),  # the anchor tick itself
+                (5_250_000_000, 252_000),  # 0.25s after (slower segment)
+                (5_500_000_000, 264_000),  # 0.5s after (slower segment)
+            ],
+        )
+
+    def test_anchor_inside_linear_ramp(self):
+        payload = {
+            **self.RAMP,
+            "clock_anchor": {
+                "tick": 240,
+                "time_nanoseconds": 3_000_000_000,
+                "sample_frame": 144_000,
+            },
+            "cues": [cue("t0", 0), cue("t120", 120), cue("t480", 480), cue("t720", 720)],
+        }
+        cues = {c["id"]: c for c in project(payload)}
+        # elapsed(240) = 250000us; offsets are exact signed trapezoid areas.
+        self.assertEqual(
+            [(c["time_nanoseconds"], c["sample_frame"]) for c in cues.values()],
+            [
+                (2_750_000_000, 132_000),  # -250000us across the ramp
+                (2_887_500_000, 138_600),  # -112500us across the ramp
+                (3_150_000_000, 151_200),  # +150000us to the ramp end
+                (3_250_000_000, 156_000),  # +250000us into the constant tail
+            ],
+        )
+
+    def test_zero_anchor_at_origin_matches_unanchored(self):
+        cues_list = [cue("a", 0), cue("b", 240), cue("c", 480), cue("d", 721)]
+        plain = project({**self.RAMP, "cues": cues_list})
+        anchored = project(
+            {
+                **self.RAMP,
+                "clock_anchor": {"tick": 0, "time_nanoseconds": 0, "sample_frame": 0},
+                "cues": cues_list,
+            }
+        )
+        self.assertEqual(plain, anchored)
+
+    def test_anchor_after_cue_rounds_final_sum_half_even(self):
+        # tpq=2000, tempo 3us/quarter: one tick is exactly 1.5ns.
+        # Anchor sits after the cues; rounding must apply to the final
+        # signed sum (101 - 1.5 = 99.5 -> 100), never to the delta alone
+        # (which would give 101 - 2 = 99).
+        payload = {
+            "ticks_per_quarter": 2000,
+            "sample_rate": 1_000_000,
+            "tempo_points": [
+                {"tick": 0, "microseconds_per_quarter": 3, "mode": "constant"}
+            ],
+            "clock_anchor": {"tick": 1, "time_nanoseconds": 101, "sample_frame": 10},
+            "cues": [cue("before", 0), cue("at", 1), cue("after", 2)],
+        }
+        cues = {c["id"]: c for c in project(payload)}
+        self.assertEqual(cues["before"]["time_nanoseconds"], 100)  # 99.5 -> 100
+        self.assertEqual(cues["at"]["time_nanoseconds"], 101)
+        self.assertEqual(cues["after"]["time_nanoseconds"], 102)  # 102.5 -> 102
+        self.assertEqual(cues["before"]["sample_frame"], 10)  # 9.9985 -> 10
+        self.assertEqual(cues["after"]["sample_frame"], 10)  # 10.0015 -> 10
+
+    def test_same_tick_cues_stay_identical_with_anchor(self):
+        payload = {
+            **self.RAMP,
+            "clock_anchor": {
+                "tick": 480,
+                "time_nanoseconds": 9_000_000_000,
+                "sample_frame": 432_000,
+            },
+            "cues": [cue("light", 240), cue("subtitle", 240), cue("record", 240)],
+        }
+        cues = project(payload)
+        self.assertEqual(len({c["time_nanoseconds"] for c in cues}), 1)
+        self.assertEqual(len({c["sample_frame"] for c in cues}), 1)
+
+    def test_anchor_beyond_last_tempo_point(self):
+        payload = {
+            **BASE,
+            "clock_anchor": {
+                "tick": 9600,
+                "time_nanoseconds": 20_000_000_000,
+                "sample_frame": 1_000_000,
+            },
+            "cues": [cue("start", 0), cue("later", 19200)],
+        }
+        cues = {c["id"]: c for c in project(payload)}
+        # Anchor sits at elapsed 10s in the held-tempo region.
+        self.assertEqual(cues["start"]["time_nanoseconds"], 10_000_000_000)
+        self.assertEqual(cues["start"]["sample_frame"], 520_000)
+        self.assertEqual(cues["later"]["time_nanoseconds"], 30_000_000_000)
+        self.assertEqual(cues["later"]["sample_frame"], 1_480_000)
+
+    def test_response_shape_is_unchanged_by_anchor(self):
+        anchored = validate_and_project(
+            {
+                **BASE,
+                "clock_anchor": {"tick": 0, "time_nanoseconds": 5, "sample_frame": 3},
+                "cues": [cue("a", 480)],
+            }
+        )[1]
+        plain = validate_and_project({**BASE, "cues": [cue("a", 480)]})[1]
+        self.assertEqual(set(anchored), set(plain))
+        self.assertEqual(set(anchored["cues"][0]), set(plain["cues"][0]))
+
+    def test_negative_projection_rejects_whole_request(self):
+        payload = {
+            **BASE,
+            "clock_anchor": {"tick": 480, "time_nanoseconds": 1000, "sample_frame": 5},
+            "cues": [cue("early", 0), cue("mid", 240), cue("ok", 480)],
+        }
+        status, body = validate_and_project(payload)
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "VALIDATION_FAILED")
+        self.assertNotIn("cues", body)
+        negative = [e for e in body["error"]["errors"] if e["code"] == "NEGATIVE_PROJECTION"]
+        self.assertEqual(
+            [e["path"] for e in negative],
+            [
+                "/cues/0/time_nanoseconds",
+                "/cues/0/sample_frame",
+                "/cues/1/time_nanoseconds",
+                "/cues/1/sample_frame",
+            ],
+        )
+        # Deterministic: an identical request yields an identical body.
+        self.assertEqual(validate_and_project(payload)[1], body)
+
+    def test_negative_projection_on_one_clock_only(self):
+        base_cues = [cue("x", 0)]
+        only_frame = {
+            **BASE,
+            "clock_anchor": {
+                "tick": 480,
+                "time_nanoseconds": 5_000_000_000,
+                "sample_frame": 5,
+            },
+            "cues": base_cues,
+        }
+        errors = errors_for(only_frame)
+        self.assertEqual(
+            [(e["code"], e["path"]) for e in errors],
+            [("NEGATIVE_PROJECTION", "/cues/0/sample_frame")],
+        )
+        only_ns = {
+            **BASE,
+            "clock_anchor": {"tick": 480, "time_nanoseconds": 5, "sample_frame": 240_000},
+            "cues": base_cues,
+        }
+        errors = errors_for(only_ns)
+        self.assertEqual(
+            [(e["code"], e["path"]) for e in errors],
+            [("NEGATIVE_PROJECTION", "/cues/0/time_nanoseconds")],
+        )
+
+    def test_anchor_must_be_an_object(self):
+        for bad in (42, "x", [], None, True):
+            payload = {**BASE, "clock_anchor": bad, "cues": [cue("a", 0)]}
+            errors = errors_for(payload)
+            matches = [
+                e
+                for e in errors
+                if e["code"] == "INVALID_TYPE" and e["path"] == "/clock_anchor"
+            ]
+            self.assertTrue(matches, f"anchor={bad!r}: {errors}")
+
+    def test_anchor_field_validation(self):
+        payload = {**BASE, "clock_anchor": {}, "cues": [cue("a", 0)]}
+        errors = errors_for(payload)
+        missing = {e["path"] for e in errors if e["code"] == "MISSING_FIELD"}
+        self.assertEqual(
+            missing,
+            {
+                "/clock_anchor/tick",
+                "/clock_anchor/time_nanoseconds",
+                "/clock_anchor/sample_frame",
+            },
+        )
+
+        payload = {
+            **BASE,
+            "clock_anchor": {
+                "tick": -1,
+                "time_nanoseconds": 1.5,
+                "sample_frame": True,
+                "extra": 0,
+            },
+            "cues": [cue("a", 0)],
+        }
+        errors = errors_for(payload)
+        codes_paths = {(e["code"], e["path"]) for e in errors}
+        self.assertIn(("ANCHOR_OUT_OF_RANGE", "/clock_anchor/tick"), codes_paths)
+        self.assertIn(("INVALID_TYPE", "/clock_anchor/time_nanoseconds"), codes_paths)
+        self.assertIn(("INVALID_TYPE", "/clock_anchor/sample_frame"), codes_paths)
+        self.assertIn(("UNKNOWN_FIELD", "/clock_anchor/extra"), codes_paths)
+
+    def test_anchor_errors_come_after_tempo_and_cue_errors(self):
+        payload = {
+            **BASE,
+            "tempo_points": [
+                {"tick": 0, "microseconds_per_quarter": 0, "mode": "constant"}
+            ],
+            "cues": [cue("a", -3)],
+            "clock_anchor": {"tick": -1},
+        }
+        errors = errors_for(payload)
+        codes = [e["code"] for e in errors]
+        self.assertEqual(
+            codes,
+            [
+                "NON_POSITIVE_TEMPO",
+                "CUE_OUT_OF_RANGE",
+                "ANCHOR_OUT_OF_RANGE",
+                "MISSING_FIELD",
+                "MISSING_FIELD",
+            ],
+        )
+
+    def test_omitted_anchor_leaves_behavior_untouched(self):
+        payload = {**BASE, "cues": [cue("a", 0), cue("b", 480), cue("c", 240)]}
+        status, body = validate_and_project(payload)
+        self.assertEqual(status, 200)
+        self.assertEqual(set(body), {"ticks_per_quarter", "cues"})
+        self.assertEqual(
+            [(c["time_nanoseconds"], c["sample_frame"]) for c in body["cues"]],
+            [(0, 0), (500_000_000, 24_000), (250_000_000, 12_000)],
+        )
+
+
 class ValidationTests(unittest.TestCase):
     def assert_code_at(self, payload, code, path):
         errors = errors_for(payload)

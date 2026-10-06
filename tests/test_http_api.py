@@ -97,6 +97,55 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(status, 400)
         self.assertEqual(body["error"]["code"], "MALFORMED_JSON")
 
+    def test_anchored_projection_success(self):
+        body = dict(GOOD_BODY)
+        body["cues"] = [{"id": "at", "tick": 480}, {"id": "before", "tick": 0}]
+        body["clock_anchor"] = {
+            "tick": 480,
+            "time_nanoseconds": 2_000_000_000,
+            "sample_frame": 100_000,
+        }
+        status, body = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 200)
+        cues = {c["id"]: c for c in body["cues"]}
+        self.assertEqual(cues["at"]["time_nanoseconds"], 2_000_000_000)
+        self.assertEqual(cues["at"]["sample_frame"], 100_000)
+        self.assertEqual(cues["before"]["time_nanoseconds"], 1_500_000_000)
+        self.assertEqual(cues["before"]["sample_frame"], 76_000)
+
+    def test_anchored_negative_projection_is_400_without_projections(self):
+        body = dict(GOOD_BODY)
+        body["clock_anchor"] = {
+            "tick": 480,
+            "time_nanoseconds": 1000,
+            "sample_frame": 5,
+        }
+        body["cues"] = [{"id": "early", "tick": 0}]
+        status, body = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(body["error"]["code"], "VALIDATION_FAILED")
+        self.assertNotIn("cues", body)
+        codes_paths = {(e["code"], e["path"]) for e in body["error"]["errors"]}
+        self.assertIn(("NEGATIVE_PROJECTION", "/cues/0/time_nanoseconds"), codes_paths)
+        self.assertIn(("NEGATIVE_PROJECTION", "/cues/0/sample_frame"), codes_paths)
+
+    def test_invalid_anchor_is_400(self):
+        body = dict(GOOD_BODY)
+        body["clock_anchor"] = {"tick": -1, "time_nanoseconds": 0}
+        status, body = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 400)
+        codes_paths = {(e["code"], e["path"]) for e in body["error"]["errors"]}
+        self.assertIn(("ANCHOR_OUT_OF_RANGE", "/clock_anchor/tick"), codes_paths)
+        self.assertIn(
+            ("MISSING_FIELD", "/clock_anchor/sample_frame"), codes_paths
+        )
+
     def test_unknown_route(self):
         status, _ = request("POST", "/nope", b"{}")
         self.assertEqual(status, 404)
