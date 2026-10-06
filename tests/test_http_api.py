@@ -90,6 +90,64 @@ class HttpApiTests(unittest.TestCase):
         self.assertIn("NON_POSITIVE_TEMPO", codes)
         self.assertIn("INVALID_MODE", codes)
 
+    def test_anchored_projection(self):
+        body = dict(GOOD_BODY)
+        body["clock_anchor"] = {
+            "tick": 480,
+            "time_nanoseconds": 10_000_000_000,
+            "sample_frame": 480_000,
+        }
+        status, response = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 200)
+        cue = response["cues"][0]
+        # The only cue sits on the anchor tick, so readings are reproduced.
+        self.assertEqual(cue["time_nanoseconds"], 10_000_000_000)
+        self.assertEqual(cue["sample_frame"], 480_000)
+
+    def test_anchored_negative_projection_is_400(self):
+        body = dict(GOOD_BODY)
+        body["cues"] = [{"id": "before", "tick": 0}, {"id": "at", "tick": 480}]
+        body["clock_anchor"] = {
+            "tick": 480,
+            "time_nanoseconds": 1,
+            "sample_frame": 1,
+        }
+        status, response = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 400)
+        self.assertEqual(response["error"]["code"], "VALIDATION_FAILED")
+        self.assertNotIn("cues", response)
+        codes_paths = {
+            (e["code"], e["path"]) for e in response["error"]["errors"]
+        }
+        self.assertIn(
+            ("NEGATIVE_PROJECTION", "/cues/0/time_nanoseconds"), codes_paths
+        )
+        self.assertIn(
+            ("NEGATIVE_PROJECTION", "/cues/0/sample_frame"), codes_paths
+        )
+
+    def test_anchor_field_validation(self):
+        body = dict(GOOD_BODY)
+        body["clock_anchor"] = {"tick": -1}
+        status, response = request(
+            "POST", "/api/timelines/project", json.dumps(body).encode()
+        )
+        self.assertEqual(status, 400)
+        codes_paths = {
+            (e["code"], e["path"]) for e in response["error"]["errors"]
+        }
+        self.assertIn(("NEGATIVE_VALUE", "/clock_anchor/tick"), codes_paths)
+        self.assertIn(
+            ("MISSING_FIELD", "/clock_anchor/time_nanoseconds"), codes_paths
+        )
+        self.assertIn(
+            ("MISSING_FIELD", "/clock_anchor/sample_frame"), codes_paths
+        )
+
     def test_malformed_json(self):
         status, body = request(
             "POST", "/api/timelines/project", b"{not json"

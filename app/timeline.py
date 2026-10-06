@@ -16,6 +16,9 @@ MICROS_PER_QUARTER_FIELD = "microseconds_per_quarter"
 TICK_FIELD = "tick"
 MODE_FIELD = "mode"
 ID_FIELD = "id"
+CLOCK_ANCHOR_FIELD = "clock_anchor"
+TIME_NANOSECONDS_FIELD = "time_nanoseconds"
+SAMPLE_FRAME_FIELD = "sample_frame"
 
 MODE_CONSTANT = "constant"
 MODE_LINEAR = "linear"
@@ -35,9 +38,11 @@ def _is_int(value: Any) -> bool:
 
 
 def _round_half_even(value: Fraction) -> int:
-    """Round a non-negative Fraction to the nearest integer, halves to even."""
+    """Round a (possibly negative) Fraction to the nearest integer, halves to even."""
     if value < 0:
-        raise TimelineError("negative duration cannot be projected")
+        # Round the magnitude with the same half-even rule, then restore the
+        # sign so a tie always lands on the even integer of either side.
+        return -_round_half_even(-value)
     floor, remainder = divmod(value.numerator, value.denominator)
     denominator = value.denominator
     doubled = 2 * remainder
@@ -67,7 +72,13 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
             }
         }
 
-    known_fields = {"ticks_per_quarter", "sample_rate", "tempo_points", "cues"}
+    known_fields = {
+        "ticks_per_quarter",
+        "sample_rate",
+        "tempo_points",
+        "cues",
+        CLOCK_ANCHOR_FIELD,
+    }
     for field in payload:
         if field not in known_fields:
             errors.append(_err("UNKNOWN_FIELD", f"/{field}", "unexpected field"))
@@ -104,6 +115,67 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
                 "sample rate must be a positive integer",
             )
         )
+
+    # Parse the optional clock anchor (session restart synchronization point).
+    anchor: tuple[int, int, int] | None = None
+    if CLOCK_ANCHOR_FIELD in payload:
+        raw_anchor = payload[CLOCK_ANCHOR_FIELD]
+        anchor_base = f"/{CLOCK_ANCHOR_FIELD}"
+        if not isinstance(raw_anchor, dict):
+            errors.append(_err("INVALID_TYPE", anchor_base, "expected object"))
+        else:
+            # Fixed tuple (not a set) so the order of emitted field errors is
+            # stable across processes with randomized string hashing.
+            anchor_fields = (TICK_FIELD, TIME_NANOSECONDS_FIELD, SAMPLE_FRAME_FIELD)
+            known_anchor_fields = set(anchor_fields)
+            for field in raw_anchor:
+                if field not in known_anchor_fields:
+                    errors.append(
+                        _err(
+                            "UNKNOWN_FIELD",
+                            f"{anchor_base}/{field}",
+                            "unexpected field",
+                        )
+                    )
+            anchor_values: dict[str, int] = {}
+            anchor_valid = True
+            for field in anchor_fields:
+                value = raw_anchor.get(field)
+                if field not in raw_anchor:
+                    errors.append(
+                        _err(
+                            "MISSING_FIELD",
+                            f"{anchor_base}/{field}",
+                            "field is required",
+                        )
+                    )
+                    anchor_valid = False
+                elif not _is_int(value):
+                    errors.append(
+                        _err(
+                            "INVALID_TYPE",
+                            f"{anchor_base}/{field}",
+                            "expected integer",
+                        )
+                    )
+                    anchor_valid = False
+                elif value < 0:
+                    errors.append(
+                        _err(
+                            "NEGATIVE_VALUE",
+                            f"{anchor_base}/{field}",
+                            "anchor value must be a non-negative integer",
+                        )
+                    )
+                    anchor_valid = False
+                else:
+                    anchor_values[field] = value
+            if anchor_valid:
+                anchor = (
+                    anchor_values[TICK_FIELD],
+                    anchor_values[TIME_NANOSECONDS_FIELD],
+                    anchor_values[SAMPLE_FRAME_FIELD],
+                )
 
     raw_points = payload.get("tempo_points")
     if "tempo_points" not in payload:
@@ -336,12 +408,40 @@ def validate_and_project(payload: Any) -> tuple[int, dict[str, Any]]:
     assert isinstance(raw_points, list)
     assert isinstance(raw_cues, list)
 
-    projected = _project(
+    projected, negatives = _project(
         ticks_per_quarter=ticks_per_quarter,
         sample_rate=sample_rate,
         points=[point for point in points if point is not None],
         cues=[cue for cue in cues if cue is not None],
+        anchor=anchor,
     )
+    if negatives:
+        for cue_index, time_negative, frame_negative in negatives:
+            base = f"/cues/{cue_index}"
+            if time_negative:
+                errors.append(
+                    _err(
+                        "NEGATIVE_PROJECTION",
+                        f"{base}/{TIME_NANOSECONDS_FIELD}",
+                        "cue projects to a negative nanosecond time under the anchor",
+                    )
+                )
+            if frame_negative:
+                errors.append(
+                    _err(
+                        "NEGATIVE_PROJECTION",
+                        f"{base}/{SAMPLE_FRAME_FIELD}",
+                        "cue projects to a negative sample frame under the anchor",
+                    )
+                )
+        return 400, {
+            "error": {
+                "code": "VALIDATION_FAILED",
+                "message": "request validation failed; no projections were produced",
+                "errors": errors,
+            }
+        }
+    assert projected is not None
     return 200, {"ticks_per_quarter": ticks_per_quarter, "cues": projected}
 
 
@@ -351,8 +451,20 @@ def _project(
     sample_rate: int,
     points: list[tuple[int, int, str]],
     cues: list[tuple[Any, int]],
-) -> list[dict[str, Any]]:
-    """Project cues.  ``points`` are validated, ordered and start at tick 0."""
+    anchor: tuple[int, int, int] | None = None,
+) -> tuple[list[dict[str, Any]] | None, list[tuple[int, bool, bool]]]:
+    """Project cues.  ``points`` are validated, ordered and start at tick 0.
+
+    With ``anchor`` of ``(tick, time_nanoseconds, sample_frame)`` every cue is
+    measured from the anchor's own exact projection: the unrounded signed
+    difference in elapsed microseconds between the cue tick and the anchor tick
+    is added to the anchor readings, and rounding happens once at the end.
+
+    Returns ``(results, negatives)``.  When the anchored projection of any cue
+    is negative, ``results`` is ``None`` and ``negatives`` lists every offending
+    cue as ``(cue_index, time_negative, sample_frame_negative)`` in request
+    order, so no partial projections are ever returned.
+    """
     tpq = Fraction(ticks_per_quarter)
     ticks = [point[0] for point in points]
     tempos = [point[1] for point in points]
@@ -371,9 +483,9 @@ def _project(
         cumulative.append(cumulative[-1] + segment)
 
     last_index = len(points) - 1
-    results: list[dict[str, Any]] = []
 
-    for cue_id, cue_tick in cues:
+    def elapsed_at(cue_tick: int) -> Fraction:
+        """Exact elapsed microseconds from tick 0 to ``cue_tick``."""
         index = bisect_right(ticks, cue_tick) - 1
         a = ticks[index]
         tempo_a = tempos[index]
@@ -395,18 +507,45 @@ def _project(
                     (tempo_b - tempo_a) * distance, 2 * (b - a)
                 )
                 elapsed += average * Fraction(distance, tpq)
+        return elapsed
 
-        time_nanoseconds = _round_half_even(elapsed * 1000)
-        sample_frame = _round_half_even(
-            elapsed * sample_rate / Fraction(1_000_000)
+    anchor_offset_ns: Fraction | None = None
+    anchor_offset_frame: Fraction | None = None
+    if anchor is not None:
+        anchor_tick, anchor_ns, anchor_frame = anchor
+        anchor_elapsed = elapsed_at(anchor_tick)
+        anchor_offset_ns = Fraction(anchor_ns) - anchor_elapsed * 1000
+        anchor_offset_frame = Fraction(anchor_frame) - (
+            anchor_elapsed * sample_rate / Fraction(1_000_000)
         )
+
+    results: list[dict[str, Any]] = []
+    negatives: list[tuple[int, bool, bool]] = []
+
+    for cue_index, (cue_id, cue_tick) in enumerate(cues):
+        elapsed = elapsed_at(cue_tick)
+        if anchor is None:
+            ns_exact = elapsed * 1000
+            frame_exact = elapsed * sample_rate / Fraction(1_000_000)
+        else:
+            assert anchor_offset_ns is not None and anchor_offset_frame is not None
+            ns_exact = elapsed * 1000 + anchor_offset_ns
+            frame_exact = (
+                elapsed * sample_rate / Fraction(1_000_000)
+            ) + anchor_offset_frame
+            if ns_exact < 0 or frame_exact < 0:
+                negatives.append((cue_index, ns_exact < 0, frame_exact < 0))
+                continue
+
         results.append(
             {
                 ID_FIELD: cue_id,
                 TICK_FIELD: cue_tick,
-                "time_nanoseconds": time_nanoseconds,
-                "sample_frame": sample_frame,
+                TIME_NANOSECONDS_FIELD: _round_half_even(ns_exact),
+                SAMPLE_FRAME_FIELD: _round_half_even(frame_exact),
             }
         )
 
-    return results
+    if negatives:
+        return None, negatives
+    return results, []

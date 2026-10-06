@@ -37,6 +37,7 @@
 | `sample_rate` | 正整数（Hz） |
 | `tempo_points` | 1–500 个；`tick` 必须从 0 开始且严格递增；`microseconds_per_quarter` 为正整数（微秒/四分音符）；`mode` 为 `constant` 或 `linear` |
 | `cues` | 1–2000 个；`id` 为非空字符串或整数且全请求唯一；`tick` 为非负整数 |
+| `clock_anchor` | 可选；对象，含 `tick`、`time_nanoseconds`、`sample_frame` 三个非负整数 |
 
 语义：
 
@@ -59,6 +60,31 @@
 
 - `time_nanoseconds = round_half_even(累计微秒 × 1000)`
 - `sample_frame = round_half_even(累计微秒 × sample_rate / 1_000_000)`（零基帧）
+
+## 会话重启与 `clock_anchor`
+
+长场次中途重启录音系统后，可在请求中携带**已确认的同步点**，把整张乐谱平移到
+新会话时钟。`clock_anchor` 为可选对象，三个字段均为非负整数：
+
+```json
+"clock_anchor": {"tick": 1920, "time_nanoseconds": 8_000_000_000, "sample_frame": 384000}
+```
+
+语义：
+
+- 锚点刻度 `tick` 在新会话时钟上的读数为 `time_nanoseconds` 纳秒、
+  `sample_frame` 帧（两台时钟分别独立锚定）。
+- 每个提示点按**锚点刻度与提示点刻度之间未舍入的有符号精确时差**
+  （`Fraction` 累计微秒之差）换算后加到锚点读数上；锚点位于提示点之前或
+  之后完全等价，舍入只在最终值上发生一次，仍为半偶规则。
+- 提示点恰在锚点刻度时，投影结果与锚点读数逐值一致。
+- 同刻度提示点仍然得到完全一致的投影。
+- 省略 `clock_anchor` 时，状态码、响应字段、错误集合与顺序、数值全部保持不变。
+
+若任一提示点在任一台时钟上的投影（舍入前的精确值）为负，整个请求返回 400，
+错误码 `NEGATIVE_PROJECTION`，`path` 精确到该提示的
+`/cues/<i>/time_nanoseconds` 或 `/cues/<i>/sample_frame`，响应不夹带任何部分
+结果；精确为零的投影仍被接受。
 
 健康检查：`GET /health` → `200 {"status":"ok"}`（同时提供 `/healthz`、`/ready`）。
 
@@ -86,9 +112,10 @@
 ```
 
 其他错误码：`MISSING_FIELD`、`INVALID_TYPE`（JSON 布尔值不接受为整数）、
-`INVALID_COUNT`、`UNKNOWN_FIELD`，以及传输层的 `MALFORMED_JSON`、
-`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。同一请求产生的错误集合与顺序是
-确定性的，可用于稳定比对。
+`INVALID_COUNT`、`UNKNOWN_FIELD`、`NEGATIVE_VALUE`（锚点字段为负）、
+`NEGATIVE_PROJECTION`（锚定下提示点投影为负，定位到具体提示与时钟），以及
+传输层的 `MALFORMED_JSON`、`EMPTY_BODY`、`BODY_TOO_LARGE`、`NOT_FOUND`。
+同一请求产生的错误集合与顺序是确定性的，可用于稳定比对。
 
 ## 本地运行（无需 Docker）
 
@@ -105,6 +132,7 @@ HOST_PORT=9090 docker compose up -d app
 
 # 一次性 verify 服务：等待 app 健康后，依次执行
 # 构建（字节码编译）、全部单元测试、恒定段/渐变段/错误请求 API 冒烟，
+# 以及 clock_anchor 跨恒定段、渐变段与负值拒绝的锚定 API 冒烟，
 # 随后自行退出，退出码即结果（0 成功）。
 docker compose up --abort-on-container-exit --exit-code-from verify verify
 ```
